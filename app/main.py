@@ -1,10 +1,14 @@
 import json
+import math
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from shapely.geometry import LineString, shape
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -86,6 +90,8 @@ from .schemas import (
     OccupancyOut,
     OccupancySegmentOut,
     PointBatch,
+    PointCorrectionBatch,
+    PointCorrectionResult,
     RendezvousReportOut,
     RendezvousSegmentOut,
     RendezvousTaskCreate,
@@ -118,19 +124,42 @@ app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
                 "支持围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验、"
-                "设备接力交班核验与隔离冲突核验",
-    version="1.7.0",
+                "设备接力交班核验、隔离冲突核验与已入库轨迹点批量坐标更正",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
 
+@app.exception_handler(RequestValidationError)
+def request_validation_error_handler(request, exc: RequestValidationError):
+    """校验失败统一返回 422；错误回显中的 NaN/Infinity（非法坐标常见来源）
+    替换为字符串，避免严格 JSON 编码失败导致 500。"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_json(jsonable_encoder(exc.errors()))},
+    )
+
+
+def _sanitize_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json(v) for v in value]
+    return value
+
+
 # ---------- 内部逻辑 ----------
 
-def recompute_device(db: Session, device_id: str) -> None:
+def recompute_device(db: Session, device_id: str, commit: bool = True) -> None:
     """按设备全量轨迹（按时间升序）重算该设备在所有围栏下的事件与当前状态。
 
     乱序点到达后重算可得到与按序到达一致的结果；重复提交因去重不产生新点，
     重算结果不变，因此不会重复产出事件。
+
+    commit=False 时只在当前事务内完成删除/写入而不提交，供坐标更正等需要
+    与坐标更新原子提交的调用方使用；调用方负责最终 commit 或 rollback。
     """
     rows = (
         db.query(TrackPointRow)
@@ -190,7 +219,8 @@ def recompute_device(db: Session, device_id: str) -> None:
                 lat=c.lat,
                 lon=c.lon,
             ))
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def fence_out(f: Fence) -> FenceOut:
@@ -372,6 +402,77 @@ def submit_points(batch: PointBatch, db: Session = Depends(get_db)):
             recompute_device(db, device_id)
 
     return IngestResult(accepted=accepted, duplicates=duplicates, devices_updated=len(devices))
+
+
+# ---------- 已入库轨迹点坐标更正 ----------
+
+
+@app.post("/points/corrections", response_model=PointCorrectionResult)
+def correct_points(batch: PointCorrectionBatch, db: Session = Depends(get_db)):
+    """批量更正已入库轨迹点坐标：按 (设备 ID, 原时间戳) 定位，替换为新经纬度。
+
+    整批先校验后生效，任一条件不满足则整批拒绝（422）、原数据保持原样：
+    非法坐标（字段校验）、同批内重复目标 (device_id, ts)、目标轨迹点不存在。
+    更正与轨迹摄入共用同一把串行锁（同一顺序串行）；坐标更新与受影响设备的
+    事件/当前状态/门线穿越重放在同一事务内一次提交，重算失败整体回滚，
+    不会留下新坐标配旧事件的中间态。其他设备的记录不变。
+
+    注意：普通重复点提交仍走 POST /points 的幂等忽略逻辑，重提交不是更正。
+    """
+    # 批内重复目标先在锁外快速失败
+    keys: list[tuple[str, float]] = []
+    seen: set[tuple[str, float]] = set()
+    for c in batch.corrections:
+        key = (c.device_id, to_epoch(c.ts))
+        if key in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"同批更正目标重复: device_id={key[0]!r}, ts={c.ts.isoformat()}",
+            )
+        seen.add(key)
+        keys.append(key)
+
+    with INGEST_LOCK:
+        # 整批存在性校验：任何一个目标点缺失都拒绝整批
+        device_ids = sorted({device_id for device_id, _ in keys})
+        rows_by_key: dict[tuple[str, float], TrackPointRow] = {}
+        for device_id in device_ids:
+            rows = db.query(TrackPointRow).filter_by(device_id=device_id).all()
+            for row in rows:
+                rows_by_key[(device_id, row.ts)] = row
+        missing = [
+            {"device_id": device_id, "ts": to_iso(ts).isoformat()}
+            for device_id, ts in keys
+            if (device_id, ts) not in rows_by_key
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "部分目标轨迹点不存在，整批更正已拒绝", "missing": missing},
+            )
+
+        try:
+            affected: set[str] = set()
+            for c, key in zip(batch.corrections, keys):
+                row = rows_by_key[key]
+                row.lat = c.lat
+                row.lon = c.lon
+                affected.add(c.device_id)
+            db.flush()  # 让后续重算读到新坐标
+
+            # 整批更新后按受影响设备重放完整轨迹，统一刷新事件、当前状态与门线穿越
+            for device_id in sorted(affected):
+                recompute_device(db, device_id, commit=False)
+            db.commit()
+        except Exception:
+            # 重算失败不能留下新坐标配旧事件：坐标更新与衍生结果整体回滚
+            db.rollback()
+            raise
+
+    return PointCorrectionResult(
+        corrected=len(batch.corrections),
+        devices_updated=len(affected),
+    )
 
 
 # ---------- 事件与状态查询 ----------

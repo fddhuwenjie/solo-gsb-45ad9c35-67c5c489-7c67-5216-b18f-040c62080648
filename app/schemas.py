@@ -1,7 +1,8 @@
+import math
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class FenceConfigSchema(BaseModel):
@@ -49,6 +50,32 @@ class IngestResult(BaseModel):
     accepted: int
     duplicates: int
     devices_updated: int
+
+
+class PointCorrectionIn(BaseModel):
+    """单条轨迹点坐标更正：按 (device_id, ts) 定位已入库的点，替换其经纬度。"""
+
+    device_id: str = Field(min_length=1, max_length=100)
+    ts: datetime = Field(description="原轨迹点时间戳（ISO 8601，缺省时区按 UTC 处理）")
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+    @field_validator("lat", "lon")
+    @classmethod
+    def check_finite(cls, v: float) -> float:
+        # 显式拒绝 NaN/Infinity（部分环境的 JSON 解析器接受 NaN 字面量）
+        if not math.isfinite(v):
+            raise ValueError("坐标必须是有限数值")
+        return v
+
+
+class PointCorrectionBatch(BaseModel):
+    corrections: list[PointCorrectionIn] = Field(min_length=1, max_length=10000)
+
+
+class PointCorrectionResult(BaseModel):
+    corrected: int = Field(description="实际更新坐标的轨迹点数量")
+    devices_updated: int = Field(description="受影响并重放轨迹的设备数量")
 
 
 class EventOut(BaseModel):
