@@ -58,6 +58,8 @@ from .schemas import (
     ClearanceTaskCreate,
     ClearanceTaskOut,
     ConflictSegmentOut,
+    CorrectionBatch,
+    CorrectionResult,
     CrossingOut,
     DeviceStatusOut,
     EventOut,
@@ -118,19 +120,22 @@ app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
                 "支持围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验、"
-                "设备接力交班核验与隔离冲突核验",
-    version="1.7.0",
+                "设备接力交班核验、隔离冲突核验与已入库轨迹点坐标更正",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
 
 # ---------- 内部逻辑 ----------
 
-def recompute_device(db: Session, device_id: str) -> None:
+def _recompute_device(db: Session, device_id: str) -> None:
     """按设备全量轨迹（按时间升序）重算该设备在所有围栏下的事件与当前状态。
 
     乱序点到达后重算可得到与按序到达一致的结果；重复提交因去重不产生新点，
     重算结果不变，因此不会重复产出事件。
+
+    本函数不提交事务：调用方自行决定提交时机（如坐标更正要求坐标更新与
+    衍生结果在同一事务中一次提交）。
     """
     rows = (
         db.query(TrackPointRow)
@@ -190,6 +195,11 @@ def recompute_device(db: Session, device_id: str) -> None:
                 lat=c.lat,
                 lon=c.lon,
             ))
+
+
+def recompute_device(db: Session, device_id: str) -> None:
+    """重算单个设备并立即提交（摄入、新建围栏/门线等逐设备提交的路径使用）。"""
+    _recompute_device(db, device_id)
     db.commit()
 
 
@@ -372,6 +382,69 @@ def submit_points(batch: PointBatch, db: Session = Depends(get_db)):
             recompute_device(db, device_id)
 
     return IngestResult(accepted=accepted, duplicates=duplicates, devices_updated=len(devices))
+
+
+# ---------- 轨迹点坐标更正 ----------
+
+@app.post("/points/corrections", response_model=CorrectionResult)
+def correct_points(batch: CorrectionBatch, db: Session = Depends(get_db)):
+    """批量更正已入库轨迹点的坐标：按 (device_id, ts) 定位，改写为新经纬度。
+
+    整批校验、整批提交：目标记录缺失、同批出现重复目标或坐标越界
+    （纬度 ±90、经度 ±180，由参数校验拦截）都会整批拒绝，原数据保持原样。
+    更正与 /points 摄入共用同一把进程内锁串行执行；整批更新后按受影响
+    设备全量重放轨迹，统一刷新围栏事件、当前状态与门线穿越记录，且坐标
+    更新与衍生结果在同一事务中一次提交——重算失败整体回滚，不会留下
+    新坐标配旧事件的中间态。未受影响设备的记录不变。
+    """
+    # 同批重复目标：同一 (device_id, ts) 出现两次即整批拒绝
+    seen: set[tuple[str, float]] = set()
+    for c in batch.corrections:
+        key = (c.device_id, to_epoch(c.ts))
+        if key in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"同批更正目标重复: device_id={c.device_id}, ts={c.ts.isoformat()}",
+            )
+        seen.add(key)
+
+    with INGEST_LOCK:
+        # 先定位全部目标：任一缺失即整批拒绝，不改写任何记录
+        located: list[tuple[TrackPointRow, float, float]] = []
+        missing = []
+        for c in batch.corrections:
+            row = (
+                db.query(TrackPointRow)
+                .filter_by(device_id=c.device_id, ts=to_epoch(c.ts))
+                .first()
+            )
+            if row is None:
+                missing.append({"device_id": c.device_id, "ts": c.ts.isoformat()})
+            else:
+                located.append((row, c.lat, c.lon))
+        if missing:
+            raise HTTPException(
+                status_code=422, detail=f"轨迹点不存在，整批拒绝: {missing}"
+            )
+
+        devices = {c.device_id for c in batch.corrections}
+        try:
+            for row, lat, lon in located:
+                row.lat = lat
+                row.lon = lon
+            db.flush()  # 会话关闭了 autoflush，重算查询前先把坐标更新刷入事务
+            for device_id in devices:
+                _recompute_device(db, device_id)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise HTTPException(
+                status_code=500, detail="坐标更正重算失败，已整体回滚"
+            )
+
+    return CorrectionResult(
+        corrected=len(batch.corrections), devices_updated=len(devices)
+    )
 
 
 # ---------- 事件与状态查询 ----------

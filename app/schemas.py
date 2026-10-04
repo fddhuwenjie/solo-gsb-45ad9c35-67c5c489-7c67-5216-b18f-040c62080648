@@ -51,6 +51,24 @@ class IngestResult(BaseModel):
     devices_updated: int
 
 
+class PointCorrectionIn(BaseModel):
+    """单条坐标更正：按 (device_id, ts) 定位已入库轨迹点，改写为新经纬度。"""
+
+    device_id: str = Field(min_length=1, max_length=100)
+    ts: datetime = Field(description="原轨迹点时间戳（ISO 8601，缺省时区按 UTC 处理）")
+    lat: float = Field(ge=-90, le=90, description="更正后的纬度")
+    lon: float = Field(ge=-180, le=180, description="更正后的经度")
+
+
+class CorrectionBatch(BaseModel):
+    corrections: list[PointCorrectionIn] = Field(min_length=1, max_length=10000)
+
+
+class CorrectionResult(BaseModel):
+    corrected: int = Field(description="实际更正的轨迹点数")
+    devices_updated: int = Field(description="被重算的设备数")
+
+
 class EventOut(BaseModel):
     id: int
     device_id: str

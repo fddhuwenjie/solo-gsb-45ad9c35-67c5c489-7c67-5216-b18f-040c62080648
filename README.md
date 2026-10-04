@@ -13,6 +13,7 @@
 - **协同到场核验**：为围栏创建 2～8 台设备组成的协同任务（有效窗口 + 最短共同在场时长，设备不得重复）；报告从 enter/leave 事件实时还原各设备半开在场区间，求全体成员共同在场的连续片段，只有窗口内持续达到时长的片段才算通过
 - **设备接力交班核验**：为围栏创建 2～8 台**按交班顺序排列且不重复**的设备（有效窗口 + 相邻交班允许的最大空档 + 最短交叠时长）；报告从 enter/leave 事件实时还原每台设备的半开在场区间，选择通过相邻交班步数最多的连续交班链，返回每步实际区间、状态与首个违规时刻
 - **隔离冲突核验**：任务配置 2～8 个**互斥围栏组**（每组 2～4 个已存在且不重复的围栏，各带有效窗口，围栏可跨组复用）；同一设备在组内同时处于两个及以上围栏即冲突，各组独立判定。报告合并各围栏当前 enter/leave 事件按半开区间重建设备状态，按设备与围栏组返回连续冲突片段、起止时刻、冲突时活跃围栏与首个冲突时刻
+- **轨迹点坐标更正**：按设备 ID + 原时间戳定位已入库轨迹点并批量改写经纬度；缺失记录、同批重复目标或非法坐标即整批拒绝，坐标更新与受影响设备的事件/状态/穿越重算在同一事务中一次提交
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -639,6 +640,70 @@ curl http://localhost:8000/isolation-tasks/1/report
 6. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。设备离开后又进入、或补录乱序点改变事件后，再次查询即按最新事件重算片段，旧片段不残留。
 7. 任务不存在返回 `404`。
 
+### 15. 轨迹点坐标更正（批量）
+
+已入库轨迹点的坐标可按 **设备 ID + 原时间戳** 定位后批量更正。更正与 `/points` 摄入共用同一串行顺序，整批更新后对受影响设备全量重放轨迹，统一刷新围栏事件、当前状态与门线穿越记录；容量、清场、巡检、协同、交班、隔离等报告在查询时由最新事件/穿越实时重建，再次查询即反映更正结果，其他设备的记录不变。
+
+**更正前**：`dev-001` 在 `08:05` 的两个点落在界外（沿用第 1 节围栏，含 50m 离开缓冲与 10s 停留确认），事件为一次进入加一次离开——
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:00Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:15Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:05:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:05:15Z", "lat": 39.894, "lon": 116.294}
+  ]}'
+
+curl 'http://localhost:8000/events?device_id=dev-001'
+# => [{"type": "enter", "ts": "2026-09-22T08:00:00Z", ...},
+#     {"type": "leave", "ts": "2026-09-22T08:05:00Z", ...}]
+```
+
+**提交更正**：`08:05` 的两个点实为定位漂移，设备当时仍在围栏内——
+
+```bash
+curl -X POST http://localhost:8000/points/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections": [
+    {"device_id": "dev-001", "ts": "2026-09-22T08:05:00Z", "lat": 39.905, "lon": 116.305},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:05:15Z", "lat": 39.905, "lon": 116.305}
+  ]}'
+# => {"corrected": 2, "devices_updated": 1}
+```
+
+**更正后**：事件、设备当前状态与门线穿越已按新坐标重算（`leave` 消失，设备保持 `inside`）——
+
+```bash
+curl 'http://localhost:8000/events?device_id=dev-001'
+# => [{"type": "enter", "ts": "2026-09-22T08:00:00Z", ...}]
+
+curl http://localhost:8000/devices/dev-001/status
+# => {"device_id": "dev-001", "fences": [
+#      {"fence_id": 1, "fence_name": "园区A（中央湖泊为孔洞）",
+#       "state": "inside", "since": "2026-09-22T08:00:00Z"}]}
+```
+
+**整批拒绝**：任一目标缺失（或同批重复、坐标越界）即整批拒绝并返回 `422`，已入库数据保持原样——
+
+```bash
+curl -X POST http://localhost:8000/points/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"corrections": [
+    {"device_id": "dev-001", "ts": "2026-09-22T08:05:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-001", "ts": "2026-09-22T09:00:00Z", "lat": 39.910, "lon": 116.310}
+  ]}'
+# => 422 {"detail": "轨迹点不存在，整批拒绝: [{'device_id': 'dev-001', 'ts': '2026-09-22T09:00:00+00:00'}]"}
+# 第一条更正也不会生效
+```
+
+**语义说明**：
+
+1. **定位与整批校验**：每条更正按 `(device_id, ts)` 精确定位一条已入库轨迹点（时间戳按 epoch 秒匹配，`Z` 与 `+00:00` 等等价写法定位同一记录）；目标记录缺失、同批出现重复目标或坐标越界（纬度 ±90、经度 ±180）都会**整批拒绝**（`422`），不产生部分生效，原数据保持原样。
+2. **串行与原子提交**：更正与 `/points` 摄入、围栏/门线创建共用同一进程内串行锁；整批坐标更新与受影响设备的事件/状态/穿越重算在**同一事务**中一次提交，重算失败整体回滚，不会留下"新坐标配旧事件"的中间态。
+3. **重放刷新**：提交后按受影响设备的全量轨迹（时间升序）重放，统一重建该设备的围栏事件、当前状态与门线穿越记录；容量占用、清场、巡检、协同、交班、隔离等报告在查询时由最新事件/穿越实时重建，再次查询即反映更正结果；未受影响设备的记录保持不变。
+4. **与 `/points` 的边界**：`/points` 仍按原规则把 `(device_id, ts)` 重复提交幂等忽略——即使坐标不同也不会改写已入库点；要修正坐标必须走 `/points/corrections`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -647,6 +712,7 @@ curl http://localhost:8000/isolation-tasks/1/report
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
 | DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务、协同任务、交班任务、引用它的隔离任务 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
+| POST | `/points/corrections` | 批量更正已入库轨迹点坐标（按设备 + 原时间戳定位，整批校验、单次事务提交） |
 | GET | `/events` | 事件查询（device_id / fence_id / type / start / end / limit / offset） |
 | GET | `/devices/{device_id}/status` | 设备当前相对各围栏的状态 |
 | POST | `/fences/{id}/capacity-rules` | 新增容量规则（生效时刻 + 正整数上限，同时刻唯一） |
@@ -710,13 +776,13 @@ app/
   models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints / rendezvous_tasks / rendezvous_members / handover_tasks / handover_members / isolation_tasks / isolation_groups / isolation_group_fences）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验、接力交班核验、隔离冲突核验）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验、接力交班核验、隔离冲突核验、坐标更正）
 Dockerfile / docker-compose.yml
 ```
 
 ## 说明与取舍
 
 - 事件按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；事件 `id` 可能随重算变化，请以 `(device_id, fence_id, type, ts)` 识别事件。门线穿越同理整体重算，请以 `(device_id, gate_id, direction, ts)` 识别。
-- 同一设备同一时间戳的轨迹点视为重复（保留首条）。
+- 同一设备同一时间戳的轨迹点视为重复（保留首条）；`/points` 重提交不会改写已入库坐标，更正坐标请用 `/points/corrections`。
 - 距离计算采用以围栏质心为原点的局部等距圆柱投影近似，围栏尺度（公里级）下误差可忽略。
 - 门线方向以**坐标书写顺序**为准（右→左为正向）；同一扇门反向画一遍会交换 forward/reverse 的语义，命名时请注意坐标顺序。
